@@ -22,6 +22,7 @@ from inspect_ai.model._model import (
 )
 from inspect_ai.model._model_output import ModelOutput
 from inspect_ai.tool._tool import Tool
+from inspect_ai.tool._tool_call import ToolCall
 from inspect_ai.tool._tool_choice import ToolChoice
 from inspect_ai.tool._tool_info import ToolInfo
 from inspect_ai.tool._tool_util import tool_to_tool_info
@@ -213,6 +214,67 @@ def _restore_operator_message_source(
         bridge._pending_operator = 0
 
 
+async def apply_bridge_tool_approval(
+    output: ModelOutput,
+    history: list[ChatMessage],
+) -> None:
+    """Apply the active tool-approval policy to a bridged agent's tool calls.
+
+    Bridged scaffolds (claude_code, codex, …) execute their own tool calls inside
+    the sandbox, so Inspect's normal `execute_tools` approval path in
+    `_call_tools.py` never runs for them and approvers never fire (see
+    https://github.com/UKGovernmentBEIS/inspect_ai/issues/4662). `bridge_generate`
+    is the single chokepoint every bridged agent routes through, and a bridged
+    agent's tool calls live only on `output.message.tool_calls`, so the policy is
+    applied here — before the `ModelOutput` is returned to the scaffold — mirroring
+    `_call_tools.execute_tool_call`.
+
+    Decisions map onto the bridged model as far as Inspect's control reaches: it
+    governs the *request* the scaffold will act on, not the scaffold's own tool
+    loop.
+
+    - `approve` (incl. an `escalate` a policy resolves to approve): pass through.
+    - `modify`: replace the call with the approver's modified version, so the
+      scaffold executes the sanctioned command instead.
+    - `terminate`: raise `TerminateSampleError` to end the sample.
+    - `reject`: cannot be honoured non-destructively — the scaffold owns the tool
+      loop, so Inspect cannot synthesize the rejected tool's result and let the
+      agent retry (the semantics `_call_tools` gives a native agent). Treated as a
+      hard stop (same effect as `terminate`), with the reason logged. A future,
+      scaffold-specific option is to rewrite the rejected call into a no-op that
+      surfaces the denial as its own result so the agent can continue.
+    """
+    from inspect_ai._util.exception import TerminateSampleError
+    from inspect_ai.approval._apply import apply_tool_approval, have_tool_approval
+
+    message = output.message
+    if not have_tool_approval() or not message.tool_calls:
+        return
+
+    conversation = list(history) + [message]
+    approved_calls: list[ToolCall] = []
+    for call in message.tool_calls:
+        approved, approval = await apply_tool_approval(
+            message.text, call, None, conversation
+        )
+        if approved:
+            approved_calls.append(
+                approval.modified if approval and approval.modified else call
+            )
+        elif approval and approval.decision == "terminate":
+            raise TerminateSampleError("Tool call approver requested termination.")
+        else:
+            explanation = approval.explanation if approval else None
+            raise TerminateSampleError(
+                "Tool call rejected by approver; a bridged scaffold cannot resume "
+                "from a rejected tool call, so the sample is terminated"
+                + (f" ({explanation})" if explanation else "")
+                + "."
+            )
+
+    message.tool_calls = approved_calls
+
+
 async def bridge_generate(
     bridge: AgentBridge,
     model: Model,
@@ -308,6 +370,11 @@ async def bridge_generate(
         ):
             refusals += 1
         else:
+            # apply any active tool-approval policy to the bridged agent's tool
+            # calls before returning the output to the scaffold (bridged scaffolds
+            # run their own tool loop, so this is the only point Inspect can gate
+            # them — see apply_bridge_tool_approval).
+            await apply_bridge_tool_approval(output, input_messages)
             return output, c_message
 
 
